@@ -6,7 +6,7 @@ import math
 import time
 import socket
 import threading
-import json
+from collections import deque
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
@@ -137,8 +137,8 @@ def draw_panel(surface, rect, label, font, border_col=COL_PANEL_BORDER,
 # Network listener – receives device status updates on LISTEN_PORT
 # ---------------------------------------------------------------------------
 # Shared state: 14 entries, one per panel.
-# Each entry is a dict  {"status": "OFF"|"ACK", "extra": "..."}
-# The mapping from array index to panel is:
+# Each entry is a dict  {"status": "OFF"|"ACK"|"AUT", "extra": "..."}
+# The mapping from index to panel is:
 #   0-5  → Lane Controller 1-6   (top row cols 0-5)
 #   6-11 → Snap Target 1-6       (bottom row cols 0-5)
 #   12   → Foyer Display         (top row col 6)
@@ -146,14 +146,56 @@ def draw_panel(surface, rect, label, font, border_col=COL_PANEL_BORDER,
 # ---------------------------------------------------------------------------
 panel_statuses = [{"status": "OFF", "extra": ""} for _ in range(14)]
 _status_lock   = threading.Lock()
+_score_queue = deque()
+
+
+def _parse_status_update(message):
+    """Parse one status update in the form 'STATUS:index[:extra]'."""
+    raw = message.strip()
+    if not raw:
+        return None
+
+    # Accept optional wrapper punctuation in case upstream sends tuple-like text.
+    raw = raw.strip("()[]{}")
+
+    parts = [p.strip() for p in raw.split(":")]
+    if len(parts) < 2:
+        return None
+
+    status = parts[0].upper()
+    if status not in {"OFF", "ACK", "AUT"}:
+        return None
+
+    try:
+        index = int(parts[1])
+    except ValueError:
+        return None
+
+    if index < 0 or index >= len(panel_statuses):
+        return None
+
+    extra = ":".join(parts[2:]).strip() if len(parts) > 2 else ""
+    return status, index, extra
+
+
+def _enqueue_lane_scores(index, extra):
+    """Queue one or more comma-separated scores for lane indices 0-5."""
+    if index < 0 or index >= 6:
+        return
+    for score in (s.strip() for s in extra.split(",")):
+        if score:
+            _score_queue.append((index + 1, score))
 
 
 def _network_listener():
-    """Run in a daemon thread.  Accepts TCP connections and reads JSON arrays.
+    """Run in a daemon thread. Accept TCP connections and read per-panel updates.
 
     Expected payload per connection:
-        A JSON-encoded array of 14 strings.  Each string has the form
-        ``"STATUS:extra_data"`` where STATUS is ``OFF`` or ``ACK``.
+        One update in the form ``"STATUS:index"`` where STATUS is one of
+        ``OFF``, ``ACK``, or ``AUT``, and index is in range 0..13.
+        Optional extra payload is accepted as ``"STATUS:index:extra_data"``.
+        For lane indices 0..5, ``AUT:index:score,score,...`` queues one or
+        more scores to animate on screen.
     The connection is closed after each message is processed.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -177,17 +219,17 @@ def _network_listener():
                     break
                 data += chunk
             if data:
-                arr = json.loads(data.decode("utf-8"))
-                if isinstance(arr, list) and len(arr) >= 14:
+                msg = data.decode("utf-8", errors="ignore")
+                parsed = _parse_status_update(msg)
+                if parsed is not None:
+                    status, index, extra = parsed
                     with _status_lock:
-                        for i in range(14):
-                            parts = str(arr[i]).split(":", 1)
-                            status = parts[0].strip().upper()
-                            extra  = parts[1].strip() if len(parts) > 1 else ""
-                            panel_statuses[i] = {
-                                "status": status,
-                                "extra":  extra,
-                            }
+                        panel_statuses[index] = {
+                            "status": status,
+                            "extra":  extra,
+                        }
+                        if status == "AUT" and extra and extra.lower() != "ok":
+                            _enqueue_lane_scores(index, extra)
         except Exception:
             pass  # silently ignore malformed messages
         finally:
@@ -212,7 +254,7 @@ def _status_bg_colour(index):
 # ---------------------------------------------------------------------------
 TOAST_DURATION = 3.0   # seconds for the full rise-and-fade animation
 TOAST_FADE_IN  = 0.4   # fraction of TOAST_DURATION used for fade-in
-TOAST_FADE_OUT = 0.4   # fraction of TOAST_DURATION used for fade-out
+TOAST_FADE_OUT = 0.1   # fraction of TOAST_DURATION used for fade-out
 
 
 class ScoreToast:
@@ -234,30 +276,34 @@ class ScoreToast:
 
     def alpha(self) -> int:
         p = self.progress()
+        # Smooth ease-in/ease-out opacity while moving upward.
         if p < TOAST_FADE_IN:
-            return int(255 * (p / TOAST_FADE_IN))
-        elif p > 1.0 - TOAST_FADE_OUT:
-            return int(255 * ((1.0 - p) / TOAST_FADE_OUT))
+            t = p / TOAST_FADE_IN
+            return int(255 * (0.5 - 0.5 * math.cos(math.pi * t)))
+        if p > 1.0 - TOAST_FADE_OUT:
+            t = (1.0 - p) / TOAST_FADE_OUT
+            return int(255 * (0.5 - 0.5 * math.cos(math.pi * max(0.0, t))))
         return 255
 
     def current_y(self) -> int:
         return int(self.start_y - self.travel * self.progress())
 
 
-# Track the last-seen extra value per lane (indices 0-5) to detect new scores
-_last_extra = [""] * 6
-
-
 def poll_score_toasts(toasts: list, start_y: int, travel: int):
-    """Check panel_statuses for new AUT score messages and spawn toasts."""
-    global _last_extra
+    """Drain queued scores; start next when current one reaches fade-out."""
+    fade_out_start = 1.0 - TOAST_FADE_OUT
+
+    # Only allow a new toast if none exist, or the newest existing toast has
+    # reached the fade-out phase.
+    if toasts:
+        newest_progress = max(t.progress() for t in toasts)
+        if newest_progress < fade_out_start:
+            return
+
     with _status_lock:
-        snapshot = [(panel_statuses[i]["status"], panel_statuses[i]["extra"])
-                    for i in range(6)]
-    for i, (status, extra) in enumerate(snapshot):
-        if status == "AUT" and extra and extra != "ok" and extra != _last_extra[i]:
-            _last_extra[i] = extra
-            toasts.append(ScoreToast(lane=i + 1, score=extra,
+        if _score_queue:
+            lane, score = _score_queue.popleft()
+            toasts.append(ScoreToast(lane=lane, score=score,
                                      start_y=start_y, travel=travel))
 
 
@@ -379,13 +425,14 @@ def main():
     panel_font   = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))
 
     # Toast fonts – used in the right-hand score area
-    toast_lane_font  = pygame.font.SysFont("Consolas", max(22, int(clock_radius * 0.13)), bold=True)
-    toast_score_font = pygame.font.SysFont("Consolas", max(60, int(clock_radius * 0.38)), bold=True)
+    toast_lane_font  = pygame.font.SysFont("Consolas", max(88, int(clock_radius * 0.52)), bold=True)
+    toast_score_font = pygame.font.SysFont("Consolas", max(240, int(clock_radius * 1.52)), bold=True)
 
     # Score toast state
-    # Toasts rise from the bottom of the upper content area (panel_area_y) upward
-    toast_start_y  = panel_area_y - 20        # y-centre where a new toast appears
-    toast_travel   = int(panel_area_y * 0.55) # upward travel in pixels over lifetime
+    # Toasts rise from 50% of screen height to the top edge (0%).
+    toast_start_y  = int(screen_h * 0.50)
+    toast_top_y    = 0
+    toast_travel   = toast_start_y - toast_top_y
     score_toasts: list = []
 
     # -----------------------------------------------------------------
@@ -523,11 +570,14 @@ def main():
         poll_score_toasts(score_toasts, toast_start_y, toast_travel)
         score_toasts[:] = [t for t in score_toasts if t.alive]
 
-        # Right-hand area: from cx to screen right, top to panel_area_y
-        toast_area_x      = cx + screen_border // 2
-        toast_area_w      = screen_w - toast_area_x - screen_border // 2
-        toast_area_top    = 10
-        toast_area_bottom = panel_area_y - 10
+        # Right-hand area: centred within the horizontal gap between the
+        # clock's right edge and the right screen border.
+        clock_right_x = cx + clock_radius
+        right_edge_x  = screen_w - screen_border
+        toast_center_x = (clock_right_x + right_edge_x) // 2
+
+        toast_area_top    = toast_top_y
+        toast_area_bottom = screen_h - 10
 
         for toast in score_toasts:
             a = toast.alpha()
@@ -541,21 +591,15 @@ def main():
             score_surf = toast_score_font.render(score_str, True, (255, 255, 100))
 
             total_h = lane_surf.get_height() + score_surf.get_height() + 4
-            # Clamp so toast never clips top or bottom of area
-            cy_toast = max(toast_area_top  + total_h // 2,
-                           min(cy_toast, toast_area_bottom - total_h // 2))
+            # Keep bottom bound only; allow upward motion to continue to top.
+            cy_toast = min(cy_toast, toast_area_bottom - total_h // 2)
 
             lane_rect  = lane_surf.get_rect(
-                centerx=toast_area_x + toast_area_w // 2,
+                centerx=toast_center_x,
                 bottom=cy_toast - 2)
             score_rect = score_surf.get_rect(
-                centerx=toast_area_x + toast_area_w // 2,
+                centerx=toast_center_x,
                 top=cy_toast + 2)
-
-            # Draw onto a per-toast SRCALPHA surface for alpha blending
-            toast_surf = pygame.Surface((toast_area_w, total_h + 20), pygame.SRCALPHA)
-            off_x = toast_area_x
-            off_y = cy_toast - total_h // 2 - 10
 
             # Lane label
             ls_alpha = lane_surf.copy()
