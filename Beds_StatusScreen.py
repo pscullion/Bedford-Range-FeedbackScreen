@@ -208,6 +208,60 @@ def _status_bg_colour(index):
 
 
 # ---------------------------------------------------------------------------
+# Score toast – animated score notification
+# ---------------------------------------------------------------------------
+TOAST_DURATION = 3.0   # seconds for the full rise-and-fade animation
+TOAST_FADE_IN  = 0.4   # fraction of TOAST_DURATION used for fade-in
+TOAST_FADE_OUT = 0.4   # fraction of TOAST_DURATION used for fade-out
+
+
+class ScoreToast:
+    """Represents one animating score pop-up for a lane."""
+    def __init__(self, lane: int, score: str, start_y: int, travel: int):
+        self.lane    = lane        # 1-based lane number
+        self.score   = score       # score string
+        self.start_y = start_y     # y centre when the toast starts
+        self.travel  = travel      # total upward pixel travel over lifetime
+        self.born    = time.time() # timestamp when toast was created
+
+    @property
+    def alive(self) -> bool:
+        return time.time() - self.born < TOAST_DURATION
+
+    def progress(self) -> float:
+        """0.0 → 1.0 over TOAST_DURATION."""
+        return min((time.time() - self.born) / TOAST_DURATION, 1.0)
+
+    def alpha(self) -> int:
+        p = self.progress()
+        if p < TOAST_FADE_IN:
+            return int(255 * (p / TOAST_FADE_IN))
+        elif p > 1.0 - TOAST_FADE_OUT:
+            return int(255 * ((1.0 - p) / TOAST_FADE_OUT))
+        return 255
+
+    def current_y(self) -> int:
+        return int(self.start_y - self.travel * self.progress())
+
+
+# Track the last-seen extra value per lane (indices 0-5) to detect new scores
+_last_extra = [""] * 6
+
+
+def poll_score_toasts(toasts: list, start_y: int, travel: int):
+    """Check panel_statuses for new AUT score messages and spawn toasts."""
+    global _last_extra
+    with _status_lock:
+        snapshot = [(panel_statuses[i]["status"], panel_statuses[i]["extra"])
+                    for i in range(6)]
+    for i, (status, extra) in enumerate(snapshot):
+        if status == "AUT" and extra and extra != "ok" and extra != _last_extra[i]:
+            _last_extra[i] = extra
+            toasts.append(ScoreToast(lane=i + 1, score=extra,
+                                     start_y=start_y, travel=travel))
+
+
+# ---------------------------------------------------------------------------
 # Build the static clock-face surface (drawn once for performance)
 # ---------------------------------------------------------------------------
 def build_face(screen_w, screen_h, cx, cy, clock_radius):
@@ -322,7 +376,19 @@ def main():
     digital_font = pygame.font.SysFont("Consolas", max(16, int(clock_radius * 0.10)))
     date_font    = pygame.font.SysFont("Consolas", max(14, int(clock_radius * 0.065)))
     label_font   = pygame.font.SysFont("Consolas", max(12, int(clock_radius * 0.05)))
-    panel_font   = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))    # -----------------------------------------------------------------
+    panel_font   = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))
+
+    # Toast fonts – used in the right-hand score area
+    toast_lane_font  = pygame.font.SysFont("Consolas", max(22, int(clock_radius * 0.13)), bold=True)
+    toast_score_font = pygame.font.SysFont("Consolas", max(60, int(clock_radius * 0.38)), bold=True)
+
+    # Score toast state
+    # Toasts rise from the bottom of the upper content area (panel_area_y) upward
+    toast_start_y  = panel_area_y - 20        # y-centre where a new toast appears
+    toast_travel   = int(panel_area_y * 0.55) # upward travel in pixels over lifetime
+    score_toasts: list = []
+
+    # -----------------------------------------------------------------
     # Start network listener (daemon thread – exits when main exits)
     # -----------------------------------------------------------------
     net_thread = threading.Thread(target=_network_listener, daemon=True)
@@ -446,10 +512,62 @@ def main():
         date_str = now.strftime("%A %d %B %Y").upper()
         dt_txt   = date_font.render(date_str, True, COL_DATE)
         dt_rect  = dt_txt.get_rect(center=(cx, cy - int(clock_radius * 0.28)))
-        screen.blit(dt_txt, dt_rect)        # Small label near bottom of face
+        screen.blit(dt_txt, dt_rect)
+
+        # Small label near bottom of face
         lbl_txt  = label_font.render("Bedford School Range", True, (60, 80, 100))
         lbl_rect = lbl_txt.get_rect(center=(cx, cy + int(clock_radius * 0.48)))
-        screen.blit(lbl_txt, lbl_rect)        # ----- bottom status panels ----------------------------------
+        screen.blit(lbl_txt, lbl_rect)
+
+        # ----- score toasts (right-hand area) ------------------------
+        poll_score_toasts(score_toasts, toast_start_y, toast_travel)
+        score_toasts[:] = [t for t in score_toasts if t.alive]
+
+        # Right-hand area: from cx to screen right, top to panel_area_y
+        toast_area_x      = cx + screen_border // 2
+        toast_area_w      = screen_w - toast_area_x - screen_border // 2
+        toast_area_top    = 10
+        toast_area_bottom = panel_area_y - 10
+
+        for toast in score_toasts:
+            a = toast.alpha()
+            cy_toast = toast.current_y()
+
+            # Measure text
+            lane_str  = f"LANE {toast.lane}"
+            score_str = toast.score
+
+            lane_surf  = toast_lane_font.render(lane_str,  True, (180, 220, 255))
+            score_surf = toast_score_font.render(score_str, True, (255, 255, 100))
+
+            total_h = lane_surf.get_height() + score_surf.get_height() + 4
+            # Clamp so toast never clips top or bottom of area
+            cy_toast = max(toast_area_top  + total_h // 2,
+                           min(cy_toast, toast_area_bottom - total_h // 2))
+
+            lane_rect  = lane_surf.get_rect(
+                centerx=toast_area_x + toast_area_w // 2,
+                bottom=cy_toast - 2)
+            score_rect = score_surf.get_rect(
+                centerx=toast_area_x + toast_area_w // 2,
+                top=cy_toast + 2)
+
+            # Draw onto a per-toast SRCALPHA surface for alpha blending
+            toast_surf = pygame.Surface((toast_area_w, total_h + 20), pygame.SRCALPHA)
+            off_x = toast_area_x
+            off_y = cy_toast - total_h // 2 - 10
+
+            # Lane label
+            ls_alpha = lane_surf.copy()
+            ls_alpha.set_alpha(a)
+            screen.blit(ls_alpha, lane_rect)
+
+            # Score value
+            ss_alpha = score_surf.copy()
+            ss_alpha.set_alpha(a)
+            screen.blit(ss_alpha, score_rect)
+
+        # ----- bottom status panels ----------------------------------
         # Top row: cols 0-5 → status indices 0-5, col 6 → index 12
         for col, (rect, label) in enumerate(zip(panel_rects_top, panel_labels_top)):
             idx = col if col < 6 else 12
