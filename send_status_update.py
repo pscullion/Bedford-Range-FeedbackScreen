@@ -12,7 +12,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Send one status update to Beds_StatusScreen.py. "
-            "Examples: OFF:0, ACK:12, AUT:2:10.9,10.8,10.7"
+            "Examples: OFF:0, ACK:12, AUT:2:10.9,10.8,10.7, SNAP:5, RAPID:0"
         )
     )
     parser.add_argument("message", help="Status message payload")

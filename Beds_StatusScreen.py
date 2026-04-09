@@ -12,9 +12,9 @@ from datetime import datetime
 # ---------------------------------------------------------------------------
 # Colour palette – futuristic neon-on-dark theme
 # ---------------------------------------------------------------------------
-COL_BG            = (10,  12,  18)
+COL_BG            = (10,  12,  18)       # 10,12,18 very dark blue-black background
 COL_RING_OUTER    = (0,   220, 255)      # cyan glow
-COL_RING_INNER    = (20,  30,  50)
+COL_RING_INNER    = (20,  30,  50)          ##20,30,50
 COL_TICK_MAJOR    = (0,   220, 255)
 COL_TICK_MINOR    = (40,  70,  100)
 COL_NUMBER        = (180, 220, 255)
@@ -30,13 +30,26 @@ COL_PANEL_BORDER  = (0,   220, 255, 100)  # cyan, semi-transparent
 COL_PANEL_LABEL   = (140, 180, 210)
 COL_STATUS_OFF    = (140, 20,  20)        # red  – device offline
 COL_STATUS_ACK    = (20,  120, 40)        # green – device acknowledged
-COL_STATUS_AUT    = (20,  40,  160)       # blue  – device in automatic mode
+COL_STATUS_AUT    = (10,  12,  55)        # Bedford School blue  – device in automatic mode
 LISTEN_PORT       = 5001
 
 # ---------------------------------------------------------------------------
 # Animation / easing helpers
 # ---------------------------------------------------------------------------
 INTRO_DURATION = 1.5 # seconds per phase (sweep-up / sweep-down)
+SNAP_START_ANGLE = 210.0      # roughly 7 o'clock
+SNAP_END_ANGLE   = 150.0      # roughly 5 o'clock (via clockwise sweep)
+SNAP_HOLD_TIME   = 1.0        # hold fully-drawn ring before reversing
+SNAP_RETURN_TIME = 3.0        # anti-clockwise return duration
+SNAP_RING_OFFSET = 10         # ring starts this many pixels outside face ring
+SNAP_RING_THICK  = 10         # radial thickness in pixels
+
+SNAP_COL_INNER = (90, 0, 0)       # dark red near clock face
+SNAP_COL_OUTER = (255, 90, 90)    # brighter outer red
+SNAP_COL_GLOW  = (255, 170, 170)  # soft outer glow
+RAPID_TIMER_BOX = (14, 18, 28)
+RAPID_TIMER_TEXT = (120, 240, 255)
+RAPID_TIMER_GLOW = (0, 220, 255)
 
 
 def ease_in_out_cubic(t):
@@ -53,6 +66,27 @@ def lerp_angle(a, b, t):
     if diff > 180:
         diff -= 360
     return (a + diff * t) % 360
+
+
+def lerp_clockwise(a, b, t):
+    """Interpolate angle a -> b moving clockwise in clock-angle space."""
+    diff = (b - a) % 360
+    return (a + diff * t) % 360
+
+
+def lerp_anticlockwise(a, b, t):
+    """Interpolate angle a -> b moving anti-clockwise in clock-angle space."""
+    diff = (a - b) % 360
+    return (a - diff * t) % 360
+
+
+def lerp_colour(c1, c2, t):
+    """Linear interpolation between two RGB colours."""
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -92,6 +126,84 @@ def polar_to_cart(cx, cy, angle_deg, radius):
     rad = math.radians(angle_deg - 90)
     return (cx + radius * math.cos(rad),
             cy + radius * math.sin(rad))
+
+
+def draw_clock_arc(surface, colour, cx, cy, radius, start_angle, end_angle):
+    """Draw a 1px arc in clock-angle coordinates, moving clockwise."""
+    span = (end_angle - start_angle) % 360
+    if span <= 0.05:
+        return
+
+    steps = max(24, int(span * 2.5))
+    points = [
+        polar_to_cart(cx, cy, start_angle + span * (i / steps), radius)
+        for i in range(steps + 1)
+    ]
+    pygame.draw.lines(surface, colour, False, points, 1)
+
+
+def draw_snap_ring(surface, screen_w, screen_h, cx, cy, clock_radius,
+                   start_angle, end_angle):
+    """Draw the animated SNAP ring with outward red gradient and glow."""
+    ring = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+    inner_r = clock_radius + SNAP_RING_OFFSET
+
+    for i in range(SNAP_RING_THICK):
+        t = i / max(1, SNAP_RING_THICK - 1)
+        rgb = lerp_colour(SNAP_COL_INNER, SNAP_COL_OUTER, t)
+        alpha = int(165 + 80 * t)
+        draw_clock_arc(ring, (rgb[0], rgb[1], rgb[2], alpha),
+                       cx, cy, inner_r + i, start_angle, end_angle)
+
+    # Soft glow halo beyond the ring edge.
+    glow_layers = 6
+    for g in range(glow_layers):
+        t = g / max(1, glow_layers - 1)
+        alpha = int(80 * (1.0 - t))
+        draw_clock_arc(ring, (SNAP_COL_GLOW[0], SNAP_COL_GLOW[1], SNAP_COL_GLOW[2], alpha),
+                       cx, cy, inner_r + SNAP_RING_THICK + g,
+                       start_angle, end_angle)
+
+    surface.blit(ring, (0, 0))
+
+
+def fit_font_to_rect(font_name, text, rect_w, rect_h, bold=False):
+    """Return the largest font that fits *text* inside the given rectangle."""
+    best_font = pygame.font.SysFont(font_name, 12, bold=bold)
+    lo = 12
+    hi = max(lo, rect_h)
+
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        font = pygame.font.SysFont(font_name, mid, bold=bold)
+        text_w, text_h = font.size(text)
+        if text_w <= rect_w and text_h <= rect_h:
+            best_font = font
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best_font
+
+
+def draw_rapid_timer(surface, rect, timer_text):
+    """Draw the large RAPID mode timer in the space to the right of the clock."""
+    timer_box = pygame.Rect(rect)
+    timer_box.inflate_ip(-24, -24)
+
+    font = fit_font_to_rect("Consolas", "88:88", timer_box.width, timer_box.height, bold=True)
+    text = font.render(timer_text, True, RAPID_TIMER_TEXT)
+    text_rect = text.get_rect(center=timer_box.center)
+
+    bg = pygame.Surface((timer_box.width, timer_box.height), pygame.SRCALPHA)
+    pygame.draw.rect(bg, (*RAPID_TIMER_BOX, 210), bg.get_rect(), border_radius=16)
+    pygame.draw.rect(bg, (*RAPID_TIMER_GLOW, 120), bg.get_rect(), 2, border_radius=16)
+    surface.blit(bg, timer_box.topleft)
+
+    glow = font.render(timer_text, True, RAPID_TIMER_GLOW)
+    glow.set_alpha(70)
+    surface.blit(glow, glow.get_rect(center=timer_box.center))
+    surface.blit(text, text_rect)
 
 
 def wrap_text(text, font, max_width):
@@ -147,6 +259,42 @@ def draw_panel(surface, rect, label, font, border_col=COL_PANEL_BORDER,
 panel_statuses = [{"status": "OFF", "extra": ""} for _ in range(14)]
 _status_lock   = threading.Lock()
 _score_queue = deque()
+_snap_lock = threading.Lock()
+_pending_snap_seconds = None
+_rapid_lock = threading.Lock()
+_pending_rapid_mode = None
+
+
+def _set_pending_snap(seconds):
+    """Store the latest SNAP duration request from the network thread."""
+    global _pending_snap_seconds
+    with _snap_lock:
+        _pending_snap_seconds = seconds
+
+
+def _consume_pending_snap():
+    """Fetch and clear any queued SNAP duration request."""
+    global _pending_snap_seconds
+    with _snap_lock:
+        seconds = _pending_snap_seconds
+        _pending_snap_seconds = None
+    return seconds
+
+
+def _set_pending_rapid_mode(mode):
+    """Store the latest RAPID mode request from the network thread."""
+    global _pending_rapid_mode
+    with _rapid_lock:
+        _pending_rapid_mode = mode
+
+
+def _consume_pending_rapid_mode():
+    """Fetch and clear any queued RAPID mode request."""
+    global _pending_rapid_mode
+    with _rapid_lock:
+        mode = _pending_rapid_mode
+        _pending_rapid_mode = None
+    return mode
 
 
 def _parse_status_update(message):
@@ -178,6 +326,46 @@ def _parse_status_update(message):
     return status, index, extra
 
 
+def _parse_snap_command(message):
+    """Parse SNAP command in the form 'SNAP:numberOfSeconds'."""
+    raw = message.strip()
+    if not raw:
+        return None
+
+    raw = raw.strip("()[]{}")
+
+    parts = [p.strip() for p in raw.split(":", 1)]
+    if len(parts) != 2 or parts[0].upper() != "SNAP":
+        return None
+
+    try:
+        duration = float(parts[1])
+    except ValueError:
+        return None
+
+    if duration <= 0:
+        return None
+    return duration
+
+
+def _parse_rapid_command(message):
+    """Parse RAPID command in the form 'RAPID:mode'."""
+    raw = message.strip()
+    if not raw:
+        return None
+
+    raw = raw.strip("()[]{}")
+
+    parts = [p.strip() for p in raw.split(":", 1)]
+    if len(parts) != 2 or parts[0].upper() != "RAPID":
+        return None
+
+    try:
+        return int(parts[1])
+    except ValueError:
+        return None
+
+
 def _enqueue_lane_scores(index, extra):
     """Queue one or more comma-separated scores for lane indices 0-5."""
     if index < 0 or index >= 6:
@@ -196,6 +384,8 @@ def _network_listener():
         Optional extra payload is accepted as ``"STATUS:index:extra_data"``.
         For lane indices 0..5, ``AUT:index:score,score,...`` queues one or
         more scores to animate on screen.
+        SNAP animation can also be triggered with ``"SNAP:numberOfSeconds"``.
+        RAPID mode can also be triggered with ``"RAPID:mode"``.
     The connection is closed after each message is processed.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -230,6 +420,14 @@ def _network_listener():
                         }
                         if status == "AUT" and extra and extra.lower() != "ok":
                             _enqueue_lane_scores(index, extra)
+                else:
+                    snap_seconds = _parse_snap_command(msg)
+                    if snap_seconds is not None:
+                        _set_pending_snap(snap_seconds)
+                    else:
+                        rapid_mode = _parse_rapid_command(msg)
+                        if rapid_mode is not None:
+                            _set_pending_rapid_mode(rapid_mode)
         except Exception:
             pass  # silently ignore malformed messages
         finally:
@@ -390,7 +588,7 @@ def main():
         "Range Display",
     ]
 
-    screen_border = 50                                  # 50 px border L/R/B
+    screen_border = 20                                  # 50 px border L/R/B
     num_cols      = 7
     panel_gap     = 6                                   # gap between panels
     panel_h       = max(36, int(screen_h * 0.042))      # slightly smaller rows
@@ -412,7 +610,7 @@ def main():
     # vertically centred in the gap between screen top and panel area
     clock_diameter = int(screen_h * 2 / 3)
     clock_radius   = clock_diameter // 2
-    cx = screen_w // 3          # centre of the left third
+    cx = screen_w // 3 - 100     # shifted 20 px left
     cy = panel_area_y // 2      # centred in the space above the panels
 
     # Pre-render the static face
@@ -457,6 +655,18 @@ def main():
     TWELVE       = 0.0                    # 0° == 12 o'clock
     intro_start  = time.time()
     intro_done   = False
+
+    # SNAP animation state
+    snap_start_time = None
+    snap_duration = 0.0
+
+    # RAPID mode state
+    rapid_mode = None
+    rapid_anim_start = None
+    rapid_from_second = 0.0
+    rapid_from_minute = 0.0
+    rapid_from_hour = 0.0
+    rapid_timer_text = "00:00"
 
     # -----------------------------------------------------------------
     # Main loop
@@ -509,9 +719,67 @@ def main():
             minute_angle = target_minute
             hour_angle   = target_hour
 
+        pending_rapid_mode = _consume_pending_rapid_mode()
+        if pending_rapid_mode is not None:
+            if pending_rapid_mode == 0:
+                rapid_mode = 0
+                rapid_anim_start = time.time()
+                rapid_from_second = second_angle
+                rapid_from_minute = minute_angle
+                rapid_from_hour = hour_angle
+                rapid_timer_text = "00:00"
+
+        if rapid_mode == 0:
+            if rapid_anim_start is not None:
+                rapid_elapsed = time.time() - rapid_anim_start
+                if rapid_elapsed < INTRO_DURATION:
+                    t = ease_in_out_cubic(min(rapid_elapsed / INTRO_DURATION, 1.0))
+                    second_angle = lerp_angle(rapid_from_second, TWELVE, t)
+                    minute_angle = lerp_angle(rapid_from_minute, TWELVE, t)
+                    hour_angle = lerp_angle(rapid_from_hour, TWELVE, t)
+                else:
+                    rapid_anim_start = None
+                    second_angle = TWELVE
+                    minute_angle = TWELVE
+                    hour_angle = TWELVE
+            else:
+                second_angle = TWELVE
+                minute_angle = TWELVE
+                hour_angle = TWELVE
+
         # --- draw ----------------------------------------------------
         screen.fill(COL_BG)
         screen.blit(face_surf, (0, 0))
+
+        # Trigger/restart SNAP animation if a new command has arrived.
+        pending_snap_seconds = _consume_pending_snap()
+        if pending_snap_seconds is not None:
+            snap_start_time = time.time()
+            snap_duration = pending_snap_seconds
+
+        if snap_start_time is not None:
+            snap_elapsed = time.time() - snap_start_time
+            snap_visible = False
+            snap_end_angle = SNAP_START_ANGLE
+
+            if snap_elapsed < snap_duration:
+                t = min(snap_elapsed / snap_duration, 1.0)
+                snap_end_angle = lerp_clockwise(SNAP_START_ANGLE, SNAP_END_ANGLE, t)
+                snap_visible = True
+            elif snap_elapsed < snap_duration + SNAP_HOLD_TIME:
+                snap_end_angle = SNAP_END_ANGLE
+                snap_visible = True
+            elif snap_elapsed < snap_duration + SNAP_HOLD_TIME + SNAP_RETURN_TIME:
+                t = ((snap_elapsed - snap_duration - SNAP_HOLD_TIME)
+                     / SNAP_RETURN_TIME)
+                snap_end_angle = lerp_anticlockwise(SNAP_END_ANGLE, SNAP_START_ANGLE, t)
+                snap_visible = True
+            else:
+                snap_start_time = None
+
+            if snap_visible:
+                draw_snap_ring(screen, screen_w, screen_h, cx, cy, clock_radius,
+                               SNAP_START_ANGLE, snap_end_angle)
 
         # Decorative rotating arcs (subtle futuristic flair)
         arc_time = time.time()
@@ -567,9 +835,6 @@ def main():
         screen.blit(lbl_txt, lbl_rect)
 
         # ----- score toasts (right-hand area) ------------------------
-        poll_score_toasts(score_toasts, toast_start_y, toast_travel)
-        score_toasts[:] = [t for t in score_toasts if t.alive]
-
         # Right-hand area: centred within the horizontal gap between the
         # clock's right edge and the right screen border.
         clock_right_x = cx + clock_radius
@@ -579,37 +844,50 @@ def main():
         toast_area_top    = toast_top_y
         toast_area_bottom = screen_h - 10
 
-        for toast in score_toasts:
-            a = toast.alpha()
-            cy_toast = toast.current_y()
+        if rapid_mode == 0:
+            rapid_left = clock_right_x + 20
+            rapid_rect = pygame.Rect(
+                rapid_left,
+                screen_border,
+                max(80, right_edge_x - rapid_left - 20),
+                max(80, panel_area_y - screen_border - 12),
+            )
+            draw_rapid_timer(screen, rapid_rect, rapid_timer_text)
+        else:
+            poll_score_toasts(score_toasts, toast_start_y, toast_travel)
+            score_toasts[:] = [t for t in score_toasts if t.alive]
 
-            # Measure text
-            lane_str  = f"LANE {toast.lane}"
-            score_str = toast.score
+            for toast in score_toasts:
+                a = toast.alpha()
+                cy_toast = toast.current_y()
 
-            lane_surf  = toast_lane_font.render(lane_str,  True, (180, 220, 255))
-            score_surf = toast_score_font.render(score_str, True, (255, 255, 100))
+                # Measure text
+                lane_str  = f"LANE {toast.lane}"
+                score_str = toast.score
 
-            total_h = lane_surf.get_height() + score_surf.get_height() + 4
-            # Keep bottom bound only; allow upward motion to continue to top.
-            cy_toast = min(cy_toast, toast_area_bottom - total_h // 2)
+                lane_surf  = toast_lane_font.render(lane_str,  True, (180, 220, 255))
+                score_surf = toast_score_font.render(score_str, True, (255, 255, 100))
 
-            lane_rect  = lane_surf.get_rect(
-                centerx=toast_center_x,
-                bottom=cy_toast - 2)
-            score_rect = score_surf.get_rect(
-                centerx=toast_center_x,
-                top=cy_toast + 2)
+                total_h = lane_surf.get_height() + score_surf.get_height() + 4
+                # Keep bottom bound only; allow upward motion to continue to top.
+                cy_toast = min(cy_toast, toast_area_bottom - total_h // 2)
 
-            # Lane label
-            ls_alpha = lane_surf.copy()
-            ls_alpha.set_alpha(a)
-            screen.blit(ls_alpha, lane_rect)
+                lane_rect  = lane_surf.get_rect(
+                    centerx=toast_center_x,
+                    bottom=cy_toast - 2)
+                score_rect = score_surf.get_rect(
+                    centerx=toast_center_x,
+                    top=cy_toast + 2)
 
-            # Score value
-            ss_alpha = score_surf.copy()
-            ss_alpha.set_alpha(a)
-            screen.blit(ss_alpha, score_rect)
+                # Lane label
+                ls_alpha = lane_surf.copy()
+                ls_alpha.set_alpha(a)
+                screen.blit(ls_alpha, lane_rect)
+
+                # Score value
+                ss_alpha = score_surf.copy()
+                ss_alpha.set_alpha(a)
+                screen.blit(ss_alpha, score_rect)
 
         # ----- bottom status panels ----------------------------------
         # Top row: cols 0-5 → status indices 0-5, col 6 → index 12
