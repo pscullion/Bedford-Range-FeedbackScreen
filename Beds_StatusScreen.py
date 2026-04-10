@@ -257,12 +257,15 @@ def draw_panel(surface, rect, label, font, border_col=COL_PANEL_BORDER,
 #   13   → Range Display         (bottom row col 6)
 # ---------------------------------------------------------------------------
 panel_statuses = [{"status": "OFF", "extra": ""} for _ in range(14)]
+lane_scores    = [0] * 6          # cumulative score per lane controller (indices 0-5)
 _status_lock   = threading.Lock()
 _score_queue = deque()
 _snap_lock = threading.Lock()
 _pending_snap_seconds = None
 _rapid_lock = threading.Lock()
 _pending_rapid_mode = None
+_reset_lock = threading.Lock()
+_pending_reset = False
 
 
 def _set_pending_snap(seconds):
@@ -295,6 +298,22 @@ def _consume_pending_rapid_mode():
         mode = _pending_rapid_mode
         _pending_rapid_mode = None
     return mode
+
+
+def _set_pending_reset():
+    """Queue a RESET request from the network thread."""
+    global _pending_reset
+    with _reset_lock:
+        _pending_reset = True
+
+
+def _consume_pending_reset():
+    """Fetch and clear any queued RESET request."""
+    global _pending_reset
+    with _reset_lock:
+        pending = _pending_reset
+        _pending_reset = False
+    return pending
 
 
 def _parse_status_update(message):
@@ -366,6 +385,16 @@ def _parse_rapid_command(message):
         return None
 
 
+def _parse_reset_command(message):
+    """Parse RESET command in the exact form 'RESET'."""
+    raw = message.strip()
+    if not raw:
+        return False
+
+    raw = raw.strip("()[]{}:")
+    return raw.upper() == "RESET"
+
+
 def _enqueue_lane_scores(index, extra):
     """Queue one or more comma-separated scores for lane indices 0-5."""
     if index < 0 or index >= 6:
@@ -420,6 +449,14 @@ def _network_listener():
                         }
                         if status == "AUT" and extra and extra.lower() != "ok":
                             _enqueue_lane_scores(index, extra)
+                            if index < 6:
+                                for s in extra.split(","):
+                                    try:
+                                        lane_scores[index] += float(s.strip())
+                                    except ValueError:
+                                        pass
+                        elif status == "ACK" and index < 6:
+                            lane_scores[index] = 0
                 else:
                     snap_seconds = _parse_snap_command(msg)
                     if snap_seconds is not None:
@@ -428,6 +465,8 @@ def _network_listener():
                         rapid_mode = _parse_rapid_command(msg)
                         if rapid_mode is not None:
                             _set_pending_rapid_mode(rapid_mode)
+                        elif _parse_reset_command(msg):
+                            _set_pending_reset()
         except Exception:
             pass  # silently ignore malformed messages
         finally:
@@ -508,7 +547,7 @@ def poll_score_toasts(toasts: list, start_y: int, travel: int):
 # ---------------------------------------------------------------------------
 # Build the static clock-face surface (drawn once for performance)
 # ---------------------------------------------------------------------------
-def build_face(screen_w, screen_h, cx, cy, clock_radius):
+def build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=False):
     face = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
 
     # Outer glow rings
@@ -545,13 +584,14 @@ def build_face(screen_w, screen_h, cx, cy, clock_radius):
         else:
             pygame.draw.aaline(face, colour, p1, p2)
 
-    # Hour numbers
+    # Clock-face numbers
     num_font_size = max(18, int(clock_radius * 0.13))
     num_font = pygame.font.SysFont("Consolas", num_font_size, bold=True)
     for hour in range(1, 13):
         angle = hour * 30
         pos   = polar_to_cart(cx, cy, angle, clock_radius - 60)
-        txt   = num_font.render(str(hour), True, COL_NUMBER)
+        label = str(hour * 5) if rapid_scale else str(hour)
+        txt   = num_font.render(label, True, COL_NUMBER)
         rect  = txt.get_rect(center=(int(pos[0]), int(pos[1])))
         face.blit(txt, rect)
 
@@ -613,14 +653,16 @@ def main():
     cx = screen_w // 3 - 100     # shifted 20 px left
     cy = panel_area_y // 2      # centred in the space above the panels
 
-    # Pre-render the static face
-    face_surf = build_face(screen_w, screen_h, cx, cy, clock_radius)
+    # Pre-render both static faces (normal and RAPID scale)
+    face_surf_normal = build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=False)
+    face_surf_rapid = build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=True)
 
     # Fonts
     digital_font = pygame.font.SysFont("Consolas", max(16, int(clock_radius * 0.10)))
     date_font    = pygame.font.SysFont("Consolas", max(14, int(clock_radius * 0.065)))
     label_font   = pygame.font.SysFont("Consolas", max(12, int(clock_radius * 0.05)))
-    panel_font   = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))
+    panel_font      = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))
+    lane_score_font = pygame.font.SysFont("Consolas", max(18, panel_h), bold=True)
 
     # Toast fonts – used in the right-hand score area
     toast_lane_font  = pygame.font.SysFont("Consolas", max(88, int(clock_radius * 0.52)), bold=True)
@@ -661,12 +703,26 @@ def main():
     snap_duration = 0.0
 
     # RAPID mode state
+    #   None -> normal clock mode
+    #   0    -> RAPID armed/reset (animated to top, timer at 00:00)
+    #   1    -> RAPID running
+    #   2    -> RAPID stopped (frozen)
     rapid_mode = None
     rapid_anim_start = None
     rapid_from_second = 0.0
     rapid_from_minute = 0.0
     rapid_from_hour = 0.0
+    rapid_run_start = None
+    rapid_elapsed = 0.0
     rapid_timer_text = "00:00"
+
+    # RESET animation state
+    reset_anim_phase = None  # None | "up" | "down"
+    reset_anim_start = 0.0
+    reset_from_second = 0.0
+    reset_from_minute = 0.0
+    reset_from_hour = 0.0
+    reset_show_rapid_face = False
 
     # -----------------------------------------------------------------
     # Main loop
@@ -719,36 +775,171 @@ def main():
             minute_angle = target_minute
             hour_angle   = target_hour
 
+        pending_reset = _consume_pending_reset()
+        if pending_reset:
+            # Capture visible hand positions before leaving RAPID mode.
+            from_second = second_angle
+            from_minute = minute_angle
+            from_hour = hour_angle
+
+            if rapid_mode == 2:
+                from_second = (rapid_elapsed * 360.0) % 360.0
+                from_minute = (rapid_elapsed * 6.0) % 360.0
+                from_hour = ((rapid_elapsed / 60.0) * 6.0) % 360.0
+            elif rapid_mode == 1 and rapid_run_start is not None:
+                run_elapsed = max(0.0, time.time() - rapid_run_start)
+                from_second = (run_elapsed * 360.0) % 360.0
+                from_minute = (run_elapsed * 6.0) % 360.0
+                from_hour = ((run_elapsed / 60.0) * 6.0) % 360.0
+            elif rapid_mode == 0 and rapid_anim_start is not None:
+                anim_elapsed = time.time() - rapid_anim_start
+                t = ease_in_out_cubic(min(anim_elapsed / INTRO_DURATION, 1.0))
+                from_second = lerp_angle(rapid_from_second, TWELVE, t)
+                from_minute = lerp_angle(rapid_from_minute, TWELVE, t)
+                from_hour = lerp_angle(rapid_from_hour, TWELVE, t)
+
+            # Reset all panel statuses to red (OFF) awaiting fresh updates.
+            with _status_lock:
+                for i in range(len(panel_statuses)):
+                    panel_statuses[i] = {"status": "OFF", "extra": ""}
+                for i in range(6):
+                    lane_scores[i] = 0
+
+            # Start reset sequence: up to 12, then down to current time.
+            reset_anim_phase = "up"
+            reset_anim_start = time.time()
+            reset_from_second = from_second
+            reset_from_minute = from_minute
+            reset_from_hour = from_hour
+            reset_show_rapid_face = rapid_mode in (0, 1, 2)
+
+            # Leave RAPID mode immediately (hides right-hand timer).
+            rapid_mode = None
+            rapid_anim_start = None
+            rapid_run_start = None
+            rapid_elapsed = 0.0
+            rapid_timer_text = "00:00"
+
         pending_rapid_mode = _consume_pending_rapid_mode()
-        if pending_rapid_mode is not None:
+        if pending_rapid_mode is not None and reset_anim_phase is None:
             if pending_rapid_mode == 0:
+                # Enter/reset RAPID arm state: animate current hand positions
+                # back to 12 and reset timer to 00:00.
+                from_second = second_angle
+                from_minute = minute_angle
+                from_hour = hour_angle
+
+                if rapid_mode == 2:
+                    # If frozen, animate from frozen RAPID hand positions.
+                    from_second = (rapid_elapsed * 360.0) % 360.0
+                    from_minute = (rapid_elapsed * 6.0) % 360.0
+                    from_hour = ((rapid_elapsed / 60.0) * 6.0) % 360.0
+                elif rapid_mode == 1 and rapid_run_start is not None:
+                    # If running, animate from current RAPID hand positions.
+                    run_elapsed = max(0.0, time.time() - rapid_run_start)
+                    from_second = (run_elapsed * 360.0) % 360.0
+                    from_minute = (run_elapsed * 6.0) % 360.0
+                    from_hour = ((run_elapsed / 60.0) * 6.0) % 360.0
+
                 rapid_mode = 0
                 rapid_anim_start = time.time()
-                rapid_from_second = second_angle
-                rapid_from_minute = minute_angle
-                rapid_from_hour = hour_angle
+                rapid_from_second = from_second
+                rapid_from_minute = from_minute
+                rapid_from_hour = from_hour
+                rapid_run_start = None
+                rapid_elapsed = 0.0
                 rapid_timer_text = "00:00"
+            elif pending_rapid_mode == 1:
+                # Start RAPID timer. If currently stopped, resume from frozen
+                # elapsed time; otherwise start/restart from zero.
+                if rapid_mode == 2:
+                    rapid_mode = 1
+                    rapid_anim_start = None
+                    rapid_run_start = time.time() - rapid_elapsed
+                else:
+                    rapid_mode = 1
+                    rapid_anim_start = None
+                    rapid_run_start = time.time()
+                    rapid_elapsed = 0.0
+                    rapid_timer_text = "00:00"
+            elif pending_rapid_mode == 2 and rapid_mode in (0, 1, 2):
+                # Stop/freeze RAPID timers at current elapsed value.
+                if rapid_mode == 1 and rapid_run_start is not None:
+                    rapid_elapsed = max(0.0, time.time() - rapid_run_start)
+                rapid_mode = 2
+                rapid_run_start = None
+                rapid_anim_start = None
 
-        if rapid_mode == 0:
+        if reset_anim_phase == "up":
+            elapsed = time.time() - reset_anim_start
+            if elapsed < INTRO_DURATION:
+                t = ease_in_out_cubic(min(elapsed / INTRO_DURATION, 1.0))
+                second_angle = lerp_angle(reset_from_second, TWELVE, t)
+                minute_angle = lerp_angle(reset_from_minute, TWELVE, t)
+                hour_angle = lerp_angle(reset_from_hour, TWELVE, t)
+            else:
+                second_angle = TWELVE
+                minute_angle = TWELVE
+                hour_angle = TWELVE
+                reset_anim_phase = "down"
+                reset_anim_start = time.time()
+                # After reaching 12, restore normal clock-face labels.
+                reset_show_rapid_face = False
+        elif reset_anim_phase == "down":
+            elapsed = time.time() - reset_anim_start
+            if elapsed < INTRO_DURATION:
+                t = ease_in_out_cubic(min(elapsed / INTRO_DURATION, 1.0))
+                second_angle = lerp_angle(TWELVE, target_second, t)
+                minute_angle = lerp_angle(TWELVE, target_minute, t)
+                hour_angle = lerp_angle(TWELVE, target_hour, t)
+            else:
+                reset_anim_phase = None
+                second_angle = target_second
+                minute_angle = target_minute
+                hour_angle = target_hour
+        elif rapid_mode == 0:
             if rapid_anim_start is not None:
-                rapid_elapsed = time.time() - rapid_anim_start
-                if rapid_elapsed < INTRO_DURATION:
-                    t = ease_in_out_cubic(min(rapid_elapsed / INTRO_DURATION, 1.0))
+                anim_elapsed = time.time() - rapid_anim_start
+                if anim_elapsed < INTRO_DURATION:
+                    t = ease_in_out_cubic(min(anim_elapsed / INTRO_DURATION, 1.0))
                     second_angle = lerp_angle(rapid_from_second, TWELVE, t)
                     minute_angle = lerp_angle(rapid_from_minute, TWELVE, t)
                     hour_angle = lerp_angle(rapid_from_hour, TWELVE, t)
                 else:
                     rapid_anim_start = None
-                    second_angle = TWELVE
-                    minute_angle = TWELVE
-                    hour_angle = TWELVE
+                    second_angle = 0.0
+                    minute_angle = 0.0
+                    hour_angle = 0.0
             else:
-                second_angle = TWELVE
-                minute_angle = TWELVE
-                hour_angle = TWELVE
+                second_angle = 0.0
+                minute_angle = 0.0
+                hour_angle = 0.0
+
+            rapid_elapsed = 0.0
+            rapid_timer_text = "00:00"
+        elif rapid_mode == 1:
+            rapid_elapsed = max(0.0, time.time() - rapid_run_start) if rapid_run_start else 0.0
+            # RAPID mapping:
+            #   red second hand   -> milliseconds (1 rotation / second)
+            #   long minute hand  -> seconds      (1 rotation / minute)
+            #   short hour hand   -> minutes      (1 rotation / hour)
+            second_angle = (rapid_elapsed * 360.0) % 360.0
+            minute_angle = (rapid_elapsed * 6.0) % 360.0
+            hour_angle = ((rapid_elapsed / 60.0) * 6.0) % 360.0
+
+            whole_seconds = int(rapid_elapsed)
+            rapid_timer_text = f"{whole_seconds // 60:02d}:{whole_seconds % 60:02d}"
+        elif rapid_mode == 2:
+            # Keep displaying the frozen elapsed value and corresponding hand angles.
+            second_angle = (rapid_elapsed * 360.0) % 360.0
+            minute_angle = (rapid_elapsed * 6.0) % 360.0
+            hour_angle = ((rapid_elapsed / 60.0) * 6.0) % 360.0
+            whole_seconds = int(rapid_elapsed)
+            rapid_timer_text = f"{whole_seconds // 60:02d}:{whole_seconds % 60:02d}"
 
         # --- draw ----------------------------------------------------
         screen.fill(COL_BG)
+        face_surf = face_surf_rapid if (reset_show_rapid_face or rapid_mode in (0, 1, 2)) else face_surf_normal
         screen.blit(face_surf, (0, 0))
 
         # Trigger/restart SNAP animation if a new command has arrived.
@@ -844,8 +1035,8 @@ def main():
         toast_area_top    = toast_top_y
         toast_area_bottom = screen_h - 10
 
-        if rapid_mode == 0:
-            rapid_left = clock_right_x + 20
+        if rapid_mode in (0, 1, 2):
+            rapid_left = clock_right_x + 50
             rapid_rect = pygame.Rect(
                 rapid_left,
                 screen_border,
@@ -890,10 +1081,26 @@ def main():
                 screen.blit(ss_alpha, score_rect)
 
         # ----- bottom status panels ----------------------------------
+        # Snapshot lane scores for this frame (under lock to avoid races).
+        with _status_lock:
+            frame_lane_scores = [
+                lane_scores[i] if panel_statuses[i]["status"] == "AUT" else None
+                for i in range(6)
+            ]
         # Top row: cols 0-5 → status indices 0-5, col 6 → index 12
         for col, (rect, label) in enumerate(zip(panel_rects_top, panel_labels_top)):
             idx = col if col < 6 else 12
             draw_panel(screen, rect, label, panel_font, bg_col=_status_bg_colour(idx))
+        # Lane score numbers above each lane-controller panel when in AUT mode.
+        for col in range(6):
+            score_val = frame_lane_scores[col]
+            if score_val is not None:
+                s_txt = lane_score_font.render(str(int(score_val)), True, (255, 255, 100))
+                s_rect = s_txt.get_rect(
+                    centerx=panel_rects_top[col].centerx,
+                    bottom=panel_rects_top[col].top - 4,
+                )
+                screen.blit(s_txt, s_rect)
         # Bottom row: cols 0-5 → status indices 6-11, col 6 → index 13
         for col, (rect, label) in enumerate(zip(panel_rects_bot, panel_labels_bot)):
             idx = col + 6 if col < 6 else 13
