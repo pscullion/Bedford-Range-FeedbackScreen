@@ -50,6 +50,9 @@ SNAP_COL_GLOW  = (255, 170, 170)  # soft outer glow
 RAPID_TIMER_BOX = (14, 18, 28)
 RAPID_TIMER_TEXT = (120, 240, 255)
 RAPID_TIMER_GLOW = (0, 220, 255)
+LOGO_HOLD_TIME = 10.0
+LOGO_FADE_TIME = 2.0
+CORNER_LOGO_FADE_TIME = 2.0
 
 
 def ease_in_out_cubic(t):
@@ -204,6 +207,67 @@ def draw_rapid_timer(surface, rect, timer_text):
     glow.set_alpha(70)
     surface.blit(glow, glow.get_rect(center=timer_box.center))
     surface.blit(text, text_rect)
+
+
+def run_startup_logo_sequence(screen, fps_clock, screen_w, screen_h):
+    """Show full-screen Bedford logo, then fade to black before main intro."""
+    logo = None
+    for path in ("Bedford-logo.jp", "bedford-logo.jp", "Bedford-logo.jpg", "bedford-logo.jpg"):
+        try:
+            logo = pygame.image.load(path).convert()
+            break
+        except (pygame.error, FileNotFoundError):
+            continue
+
+    if logo is None:
+        return True
+
+    logo = pygame.transform.smoothscale(logo, (screen_w, screen_h))
+    fade = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+    start = time.time()
+
+    while True:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                return False
+            if event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
+                return False
+
+        elapsed = time.time() - start
+        screen.blit(logo, (0, 0))
+
+        if elapsed >= LOGO_HOLD_TIME:
+            fade_t = min((elapsed - LOGO_HOLD_TIME) / LOGO_FADE_TIME, 1.0)
+            fade.fill((0, 0, 0, int(255 * fade_t)))
+            screen.blit(fade, (0, 0))
+
+        pygame.display.flip()
+        fps_clock.tick(60)
+
+        if elapsed >= LOGO_HOLD_TIME + LOGO_FADE_TIME:
+            break
+
+    return True
+
+
+def load_scaled_corner_logo(max_w, max_h):
+    """Load and scale the top-left logo to fit inside max_w x max_h."""
+    try:
+        logo = pygame.image.load("bedford-logo-small.jpg").convert_alpha()
+    except (pygame.error, FileNotFoundError):
+        return None
+
+    src_w, src_h = logo.get_size()
+    if src_w <= 0 or src_h <= 0:
+        return None
+
+    scale = min(max_w / src_w, max_h / src_h)
+    if scale <= 0:
+        return None
+
+    out_w = max(1, int(src_w * scale))
+    out_h = max(1, int(src_h * scale))
+    return pygame.transform.smoothscale(logo, (out_w, out_h))
 
 
 def wrap_text(text, font, max_width):
@@ -586,7 +650,7 @@ def build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=False):
 
     # Clock-face numbers
     num_font_size = max(18, int(clock_radius * 0.13))
-    num_font = pygame.font.SysFont("Consolas", num_font_size, bold=True)
+    num_font = pygame.font.SysFont("Arial", num_font_size, bold=True)
     for hour in range(1, 13):
         angle = hour * 30
         pos   = polar_to_cart(cx, cy, angle, clock_radius - 60)
@@ -611,6 +675,10 @@ def main():
     pygame.display.set_caption("Bedford School Range – Status Screen")
 
     fps_clock = pygame.time.Clock()
+
+    if not run_startup_logo_sequence(screen, fps_clock, screen_w, screen_h):
+        pygame.quit()
+        sys.exit()
 
     # -----------------------------------------------------------------
     # Bottom status panels – 7 columns × 2 rows (14 panels total)
@@ -657,15 +725,23 @@ def main():
     face_surf_normal = build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=False)
     face_surf_rapid = build_face(screen_w, screen_h, cx, cy, clock_radius, rapid_scale=True)
 
+    # Top-left corner logo (fades in after intro animation completes).
+    logo_margin = 12
+    max_logo_w = max(70, int(screen_w * 0.10))
+    max_logo_h = max(35, int(screen_h * 0.07))
+    corner_logo = load_scaled_corner_logo(max_logo_w, max_logo_h)
+    corner_logo_alpha = 0
+    corner_logo_fade_start = None
+
     # Fonts
-    digital_font = pygame.font.SysFont("Consolas", max(16, int(clock_radius * 0.10)))
-    date_font    = pygame.font.SysFont("Consolas", max(14, int(clock_radius * 0.065)))
-    label_font   = pygame.font.SysFont("Consolas", max(12, int(clock_radius * 0.05)))
-    panel_font      = pygame.font.SysFont("Consolas", max(13, int(clock_radius * 0.055)))
-    lane_score_font = pygame.font.SysFont("Consolas", max(18, panel_h), bold=True)
+    digital_font = pygame.font.SysFont("Arial", max(16, int(clock_radius * 0.10)))
+    date_font    = pygame.font.SysFont("Arial", max(14, int(clock_radius * 0.065)))
+    label_font   = pygame.font.SysFont("Arial", max(12, int(clock_radius * 0.05)))
+    panel_font      = pygame.font.SysFont("Arial", max(18, int(clock_radius * 0.055)))
+    lane_score_font = pygame.font.SysFont("Arial", max(20, panel_h), bold=True)
 
     # Toast fonts – used in the right-hand score area
-    toast_lane_font  = pygame.font.SysFont("Consolas", max(88, int(clock_radius * 0.52)), bold=True)
+    toast_lane_font  = pygame.font.SysFont("Arial", max(88, int(clock_radius * 0.52)), bold=True)
     toast_score_font = pygame.font.SysFont("Consolas", max(240, int(clock_radius * 1.52)), bold=True)
 
     # Score toast state
@@ -774,6 +850,14 @@ def main():
             second_angle = target_second
             minute_angle = target_minute
             hour_angle   = target_hour
+
+        if intro_done and corner_logo is not None and corner_logo_fade_start is None:
+            corner_logo_fade_start = time.time()
+
+        if corner_logo_fade_start is not None:
+            fade_elapsed = time.time() - corner_logo_fade_start
+            fade_t = min(fade_elapsed / CORNER_LOGO_FADE_TIME, 1.0)
+            corner_logo_alpha = int(255 * ease_in_out_cubic(fade_t))
 
         pending_reset = _consume_pending_reset()
         if pending_reset:
@@ -1105,6 +1189,11 @@ def main():
         for col, (rect, label) in enumerate(zip(panel_rects_bot, panel_labels_bot)):
             idx = col + 6 if col < 6 else 13
             draw_panel(screen, rect, label, panel_font, bg_col=_status_bg_colour(idx))
+
+        if corner_logo is not None and corner_logo_alpha > 0:
+            corner_logo_draw = corner_logo.copy()
+            corner_logo_draw.set_alpha(corner_logo_alpha)
+            screen.blit(corner_logo_draw, (logo_margin, logo_margin))
 
         pygame.display.flip()
         fps_clock.tick(60)   # 60 FPS for smooth second-hand sweep
