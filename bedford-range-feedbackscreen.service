@@ -1,0 +1,18 @@
+[Unit]
+Description=Bedford Range Feedback Screen
+After=graphical.target network-online.target
+Wants=graphical.target network-online.target
+
+[Service]
+Type=simple
+User=g-range-pi
+WorkingDirectory=/home/g-range-pi/Code/Bedford-Range-FeedbackScreen
+ExecStart=/home/g-range-pi/Code/Bedford-Range-FeedbackScreen/start_beds_status_screen.sh
+Restart=on-failure
+RestartSec=5
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/g-range-pi/.Xauthority
+Environment=PYGAME_HIDE_SUPPORT_PROMPT=1
+
+[Install]
+WantedBy=graphical.target

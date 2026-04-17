@@ -6,6 +6,7 @@ import math
 import time
 import socket
 import threading
+import subprocess
 from collections import deque
 from datetime import datetime
 
@@ -39,8 +40,8 @@ LISTEN_PORT       = 5001
 INTRO_DURATION = 1.5 # seconds per phase (sweep-up / sweep-down)
 SNAP_START_ANGLE = 210.0      # roughly 7 o'clock
 SNAP_END_ANGLE   = 150.0      # roughly 5 o'clock (via clockwise sweep)
-SNAP_HOLD_TIME   = 1.0        # hold fully-drawn ring before reversing
-SNAP_RETURN_TIME = 3.0        # anti-clockwise return duration
+SNAP_HOLD_TIME   = 0.5        # hold fully-drawn ring before reversing
+SNAP_RETURN_TIME = 2.0        # anti-clockwise return duration
 SNAP_RING_OFFSET = 10         # ring starts this many pixels outside face ring
 SNAP_RING_THICK  = 10         # radial thickness in pixels
 
@@ -53,6 +54,11 @@ RAPID_TIMER_GLOW = (0, 220, 255)
 LOGO_HOLD_TIME = 10.0
 LOGO_FADE_TIME = 2.0
 CORNER_LOGO_FADE_TIME = 2.0
+IP_LABEL_HOLD_TIME = 30.0
+IP_LABEL_FADE_OUT_TIME = 1.0
+SHUTDOWN_LOGO_HOLD_TIME = 5.0
+SHUTDOWN_LOGO_FADE_TIME = 5.0
+SHUTDOWN_MESSAGE_TIME = 3.0
 
 
 def ease_in_out_cubic(t):
@@ -330,6 +336,8 @@ _rapid_lock = threading.Lock()
 _pending_rapid_mode = None
 _reset_lock = threading.Lock()
 _pending_reset = False
+_shutdown_lock = threading.Lock()
+_pending_shutdown = False
 
 
 def _set_pending_snap(seconds):
@@ -380,6 +388,22 @@ def _consume_pending_reset():
     return pending
 
 
+def _set_pending_shutdown():
+    """Queue a SHUTDOWN request from the network thread."""
+    global _pending_shutdown
+    with _shutdown_lock:
+        _pending_shutdown = True
+
+
+def _consume_pending_shutdown():
+    """Fetch and clear any queued SHUTDOWN request."""
+    global _pending_shutdown
+    with _shutdown_lock:
+        pending = _pending_shutdown
+        _pending_shutdown = False
+    return pending
+
+
 def _parse_status_update(message):
     """Parse one status update in the form 'STATUS:index[:extra]'."""
     raw = message.strip()
@@ -410,7 +434,7 @@ def _parse_status_update(message):
 
 
 def _parse_snap_command(message):
-    """Parse SNAP command in the form 'SNAP:numberOfSeconds'."""
+    """Parse SNAP command in the form 'SNAP[:numberOfSeconds]' or 'SNAPS'."""
     raw = message.strip()
     if not raw:
         return None
@@ -418,7 +442,14 @@ def _parse_snap_command(message):
     raw = raw.strip("()[]{}")
 
     parts = [p.strip() for p in raw.split(":", 1)]
-    if len(parts) != 2 or parts[0].upper() != "SNAP":
+    command = parts[0].upper()
+    if command not in {"SNAP", "SNAPS"}:
+        return None
+
+    if len(parts) == 1:
+        return 1.0
+
+    if len(parts) != 2:
         return None
 
     try:
@@ -459,6 +490,16 @@ def _parse_reset_command(message):
     return raw.upper() == "RESET"
 
 
+def _parse_shutdown_command(message):
+    """Parse SHUTDOWN command in the exact form 'SHUTDOWN'."""
+    raw = message.strip()
+    if not raw:
+        return False
+
+    raw = raw.strip("()[]{}:")
+    return raw.upper() == "SHUTDOWN"
+
+
 def _enqueue_lane_scores(index, extra):
     """Queue one or more comma-separated scores for lane indices 0-5."""
     if index < 0 or index >= 6:
@@ -477,8 +518,10 @@ def _network_listener():
         Optional extra payload is accepted as ``"STATUS:index:extra_data"``.
         For lane indices 0..5, ``AUT:index:score,score,...`` queues one or
         more scores to animate on screen.
-        SNAP animation can also be triggered with ``"SNAP:numberOfSeconds"``.
+        SNAP animation can also be triggered with ``"SNAP"``,
+        ``"SNAPS"``, or ``"SNAP:numberOfSeconds"``.
         RAPID mode can also be triggered with ``"RAPID:mode"``.
+        SHUTDOWN sequence can also be triggered with ``"SHUTDOWN"``.
     The connection is closed after each message is processed.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -531,10 +574,62 @@ def _network_listener():
                             _set_pending_rapid_mode(rapid_mode)
                         elif _parse_reset_command(msg):
                             _set_pending_reset()
+                        elif _parse_shutdown_command(msg):
+                            _set_pending_shutdown()
         except Exception:
             pass  # silently ignore malformed messages
         finally:
             conn.close()
+
+
+def load_fullscreen_logo(screen_w, screen_h):
+    """Load and scale the Bedford logo to full-screen dimensions."""
+    for path in ("Bedford-logo.jp", "bedford-logo.jp", "Bedford-logo.jpg", "bedford-logo.jpg"):
+        try:
+            logo = pygame.image.load(path).convert()
+            return pygame.transform.smoothscale(logo, (screen_w, screen_h))
+        except (pygame.error, FileNotFoundError):
+            continue
+    return None
+
+
+def get_primary_ip_address():
+    """Return a best-effort LAN IP address for this machine."""
+    for host in ("8.8.8.8", "1.1.1.1"):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect((host, 80))
+            ip = sock.getsockname()[0]
+            if ip and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        finally:
+            sock.close()
+
+    try:
+        for ip in socket.gethostbyname_ex(socket.gethostname())[2]:
+            if ip and not ip.startswith("127."):
+                return ip
+    except OSError:
+        pass
+
+    return "IP unavailable"
+
+
+def request_system_shutdown():
+    """Request OS shutdown; return True if a shutdown command was launched."""
+    commands = [
+        ["sudo", "shutdown", "-h", "now"],
+        ["shutdown", "-h", "now"],
+    ]
+    for cmd in commands:
+        try:
+            subprocess.Popen(cmd)
+            return True
+        except (FileNotFoundError, PermissionError, OSError):
+            continue
+    return False
 
 
 def _status_bg_colour(index):
@@ -560,9 +655,11 @@ TOAST_FADE_OUT = 0.1   # fraction of TOAST_DURATION used for fade-out
 
 class ScoreToast:
     """Represents one animating score pop-up for a lane."""
-    def __init__(self, lane: int, score: str, start_y: int, travel: int):
+    def __init__(self, lane: int, score: str, start_y: int, travel: int,
+                 lane_label: str = ""):
         self.lane    = lane        # 1-based lane number
         self.score   = score       # score string
+        self.lane_label = lane_label
         self.start_y = start_y     # y centre when the toast starts
         self.travel  = travel      # total upward pixel travel over lifetime
         self.born    = time.time() # timestamp when toast was created
@@ -606,6 +703,17 @@ def poll_score_toasts(toasts: list, start_y: int, travel: int):
             lane, score = _score_queue.popleft()
             toasts.append(ScoreToast(lane=lane, score=score,
                                      start_y=start_y, travel=travel))
+
+
+def enqueue_snap_toast(toasts: list, snap_count: int, start_y: int, travel: int):
+    """Queue a SNAP toast using the same animation as score toasts."""
+    toasts.append(ScoreToast(
+        lane=0,
+        score=str(snap_count),
+        start_y=start_y,
+        travel=travel,
+        lane_label="Snap",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -673,6 +781,7 @@ def main():
     screen_w, screen_h = info.current_w, info.current_h
     screen = pygame.display.set_mode((screen_w, screen_h), pygame.FULLSCREEN)
     pygame.display.set_caption("Bedford School Range – Status Screen")
+    pygame.mouse.set_visible(False)
 
     fps_clock = pygame.time.Clock()
 
@@ -733,6 +842,28 @@ def main():
     corner_logo_alpha = 0
     corner_logo_fade_start = None
 
+    ip_address_text = f"{get_primary_ip_address()}"
+    ip_label_alpha = 0
+    ip_label_fade_out_start = None
+    ip_label_fade_out_from_alpha = 0
+    ip_label_surface = None
+    ip_label_pos = (logo_margin, logo_margin)
+
+    if corner_logo is not None:
+        ip_label_w = corner_logo.get_width()
+        ip_label_h = max(26, int(corner_logo.get_height() * 0.42))
+        ip_label_pos = (logo_margin, logo_margin + corner_logo.get_height() + 6)
+
+        ip_font = fit_font_to_rect("Arial", ip_address_text,
+                                   max(10, ip_label_w - 4),
+                                   max(10, ip_label_h - 2),
+                                   bold=False)
+        ip_text = ip_font.render(ip_address_text, True, (255, 255, 255))
+        ip_text_rect = ip_text.get_rect(center=(ip_label_w // 2, ip_label_h // 2))
+
+        ip_label_surface = pygame.Surface((ip_label_w, ip_label_h), pygame.SRCALPHA)
+        ip_label_surface.blit(ip_text, ip_text_rect)
+
     # Fonts
     digital_font = pygame.font.SysFont("Arial", max(16, int(clock_radius * 0.10)))
     date_font    = pygame.font.SysFont("Arial", max(14, int(clock_radius * 0.065)))
@@ -743,6 +874,7 @@ def main():
     # Toast fonts – used in the right-hand score area
     toast_lane_font  = pygame.font.SysFont("Arial", max(88, int(clock_radius * 0.52)), bold=True)
     toast_score_font = pygame.font.SysFont("Consolas", max(240, int(clock_radius * 1.52)), bold=True)
+    shutdown_font = pygame.font.SysFont("Arial", max(42, int(clock_radius * 0.24)), bold=True)
 
     # Score toast state
     # Toasts rise from 50% of screen height to the top edge (0%).
@@ -777,6 +909,8 @@ def main():
     # SNAP animation state
     snap_start_time = None
     snap_duration = 0.0
+    snap_toast_shown_for_cycle = False
+    SnapCount = 1
 
     # RAPID mode state
     #   None -> normal clock mode
@@ -799,6 +933,15 @@ def main():
     reset_from_minute = 0.0
     reset_from_hour = 0.0
     reset_show_rapid_face = False
+
+    # SHUTDOWN sequence state
+    shutdown_state = None  # None | "hands_up" | "logo_hold" | "logo_fade" | "message" | "poweroff"
+    shutdown_phase_start = 0.0
+    shutdown_from_second = 0.0
+    shutdown_from_minute = 0.0
+    shutdown_from_hour = 0.0
+    shutdown_logo = load_fullscreen_logo(screen_w, screen_h)
+    shutdown_poweroff_issued = False
 
     # -----------------------------------------------------------------
     # Main loop
@@ -858,6 +1001,130 @@ def main():
             fade_elapsed = time.time() - corner_logo_fade_start
             fade_t = min(fade_elapsed / CORNER_LOGO_FADE_TIME, 1.0)
             corner_logo_alpha = int(255 * ease_in_out_cubic(fade_t))
+            if ip_label_fade_out_start is None:
+                ip_label_alpha = corner_logo_alpha
+
+        if (
+            corner_logo_fade_start is not None
+            and ip_label_fade_out_start is None
+            and (time.time() - corner_logo_fade_start) >= IP_LABEL_HOLD_TIME
+        ):
+            ip_label_fade_out_start = time.time()
+            ip_label_fade_out_from_alpha = ip_label_alpha
+
+        if ip_label_fade_out_start is not None:
+            fade_out_elapsed = time.time() - ip_label_fade_out_start
+            fade_out_t = min(fade_out_elapsed / IP_LABEL_FADE_OUT_TIME, 1.0)
+            ip_label_alpha = int(ip_label_fade_out_from_alpha * (1.0 - fade_out_t))
+
+        pending_shutdown = _consume_pending_shutdown()
+        if pending_shutdown and shutdown_state is None:
+            # Capture the currently visible hand positions for the final sweep-up.
+            from_second = second_angle
+            from_minute = minute_angle
+            from_hour = hour_angle
+
+            if rapid_mode == 2:
+                from_second = (rapid_elapsed * 360.0) % 360.0
+                from_minute = (rapid_elapsed * 6.0) % 360.0
+                from_hour = ((rapid_elapsed / 60.0) * 6.0) % 360.0
+            elif rapid_mode == 1 and rapid_run_start is not None:
+                run_elapsed = max(0.0, time.time() - rapid_run_start)
+                from_second = (run_elapsed * 360.0) % 360.0
+                from_minute = (run_elapsed * 6.0) % 360.0
+                from_hour = ((run_elapsed / 60.0) * 6.0) % 360.0
+            elif rapid_mode == 0 and rapid_anim_start is not None:
+                anim_elapsed = time.time() - rapid_anim_start
+                t = ease_in_out_cubic(min(anim_elapsed / INTRO_DURATION, 1.0))
+                from_second = lerp_angle(rapid_from_second, TWELVE, t)
+                from_minute = lerp_angle(rapid_from_minute, TWELVE, t)
+                from_hour = lerp_angle(rapid_from_hour, TWELVE, t)
+
+            shutdown_state = "hands_up"
+            shutdown_phase_start = time.time()
+            shutdown_from_second = from_second
+            shutdown_from_minute = from_minute
+            shutdown_from_hour = from_hour
+
+            # Stop all active side animations and modes while shutdown runs.
+            rapid_mode = None
+            rapid_anim_start = None
+            rapid_run_start = None
+            snap_start_time = None
+
+        if shutdown_state is not None:
+            elapsed = time.time() - shutdown_phase_start
+
+            if shutdown_state == "hands_up":
+                if elapsed < INTRO_DURATION:
+                    t = ease_in_out_cubic(min(elapsed / INTRO_DURATION, 1.0))
+                    second_angle = lerp_angle(shutdown_from_second, TWELVE, t)
+                    minute_angle = lerp_angle(shutdown_from_minute, TWELVE, t)
+                    hour_angle = lerp_angle(shutdown_from_hour, TWELVE, t)
+                else:
+                    second_angle = TWELVE
+                    minute_angle = TWELVE
+                    hour_angle = TWELVE
+                    shutdown_state = "logo_hold"
+                    shutdown_phase_start = time.time()
+
+                screen.fill(COL_BG)
+                screen.blit(face_surf_normal, (0, 0))
+
+                h_end = polar_to_cart(cx, cy, hour_angle, clock_radius * 0.50)
+                h_tail = polar_to_cart(cx, cy, hour_angle + 180, clock_radius * 0.08)
+                thick_aa_line(screen, h_tail, h_end, COL_HOUR_HAND, 7)
+
+                m_end = polar_to_cart(cx, cy, minute_angle, clock_radius * 0.72)
+                m_tail = polar_to_cart(cx, cy, minute_angle + 180, clock_radius * 0.10)
+                thick_aa_line(screen, m_tail, m_end, COL_MINUTE_HAND, 4)
+
+                s_end = polar_to_cart(cx, cy, second_angle, clock_radius * 0.80)
+                s_tail = polar_to_cart(cx, cy, second_angle + 180, clock_radius * 0.15)
+                thick_aa_line(screen, s_tail, s_end, COL_SECOND_HAND, 2)
+
+                aa_filled_circle(screen, cx, cy, 8, COL_CENTRE_DOT)
+                aa_filled_circle(screen, cx, cy, 4, COL_SECOND_HAND)
+            elif shutdown_state == "logo_hold":
+                if shutdown_logo is not None:
+                    screen.blit(shutdown_logo, (0, 0))
+                else:
+                    screen.fill((0, 0, 0))
+                if elapsed >= SHUTDOWN_LOGO_HOLD_TIME:
+                    shutdown_state = "logo_fade"
+                    shutdown_phase_start = time.time()
+            elif shutdown_state == "logo_fade":
+                if shutdown_logo is not None:
+                    screen.blit(shutdown_logo, (0, 0))
+                else:
+                    screen.fill((0, 0, 0))
+
+                fade_t = min(elapsed / SHUTDOWN_LOGO_FADE_TIME, 1.0)
+                fade = pygame.Surface((screen_w, screen_h), pygame.SRCALPHA)
+                fade.fill((0, 0, 0, int(255 * fade_t)))
+                screen.blit(fade, (0, 0))
+
+                if elapsed >= SHUTDOWN_LOGO_FADE_TIME:
+                    shutdown_state = "message"
+                    shutdown_phase_start = time.time()
+            elif shutdown_state == "message":
+                screen.fill((0, 0, 0))
+                msg = shutdown_font.render("Shutting Down", True, (220, 220, 220))
+                msg_rect = msg.get_rect(center=(screen_w // 2, screen_h // 2))
+                screen.blit(msg, msg_rect)
+
+                if elapsed >= SHUTDOWN_MESSAGE_TIME:
+                    shutdown_state = "poweroff"
+                    shutdown_phase_start = time.time()
+            elif shutdown_state == "poweroff":
+                if not shutdown_poweroff_issued:
+                    request_system_shutdown()
+                    shutdown_poweroff_issued = True
+                running = False
+
+            pygame.display.flip()
+            fps_clock.tick(60)
+            continue
 
         pending_reset = _consume_pending_reset()
         if pending_reset:
@@ -1031,6 +1298,7 @@ def main():
         if pending_snap_seconds is not None:
             snap_start_time = time.time()
             snap_duration = pending_snap_seconds
+            snap_toast_shown_for_cycle = False
 
         if snap_start_time is not None:
             snap_elapsed = time.time() - snap_start_time
@@ -1044,6 +1312,12 @@ def main():
             elif snap_elapsed < snap_duration + SNAP_HOLD_TIME:
                 snap_end_angle = SNAP_END_ANGLE
                 snap_visible = True
+                if not snap_toast_shown_for_cycle:
+                    enqueue_snap_toast(score_toasts, SnapCount, toast_start_y, toast_travel)
+                    snap_toast_shown_for_cycle = True
+                    SnapCount += 1
+                    if SnapCount > 5:
+                        SnapCount = 1
             elif snap_elapsed < snap_duration + SNAP_HOLD_TIME + SNAP_RETURN_TIME:
                 t = ((snap_elapsed - snap_duration - SNAP_HOLD_TIME)
                      / SNAP_RETURN_TIME)
@@ -1137,7 +1411,7 @@ def main():
                 cy_toast = toast.current_y()
 
                 # Measure text
-                lane_str  = f"LANE {toast.lane}"
+                lane_str  = toast.lane_label if toast.lane_label else f"LANE {toast.lane}"
                 score_str = toast.score
 
                 lane_surf  = toast_lane_font.render(lane_str,  True, (180, 220, 255))
@@ -1194,6 +1468,11 @@ def main():
             corner_logo_draw = corner_logo.copy()
             corner_logo_draw.set_alpha(corner_logo_alpha)
             screen.blit(corner_logo_draw, (logo_margin, logo_margin))
+
+        if ip_label_surface is not None and ip_label_alpha > 0:
+            ip_label_draw = ip_label_surface.copy()
+            ip_label_draw.set_alpha(ip_label_alpha)
+            screen.blit(ip_label_draw, ip_label_pos)
 
         pygame.display.flip()
         fps_clock.tick(60)   # 60 FPS for smooth second-hand sweep
